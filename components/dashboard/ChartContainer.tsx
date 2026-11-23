@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import CandlestickChart from "@/components/charts/CandlestickChart";
 import type { TradeDirection } from "@/lib/trade";
 import { MOCK_CANDLES } from "@/lib/mockCandles";
-import type { SeriesMarker, Time } from "lightweight-charts";
+import type { CandlestickData, SeriesMarker, Time, UTCTimestamp } from "lightweight-charts";
 import type { TradeHistoryItem } from "@/lib/tradeHistory";
 
 type Props = {
@@ -48,6 +48,83 @@ function isFiniteNumber(n: unknown): n is number {
   return typeof n === "number" && Number.isFinite(n);
 }
 
+function toUTCTimestamp(ms: number): UTCTimestamp {
+  return Math.floor(ms / 1000) as UTCTimestamp;
+}
+
+type Timeframe = "1m" | "5m" | "15m" | "1h";
+
+type TradingPair = "BTCUSDT" | "ETHUSDT" | "EURUSD";
+
+function makeEurUsdMockCandles(): CandlestickData[] {
+  // Start with the existing mock dates and shape, but scale to realistic EURUSD prices.
+  // Deterministic transform keeps UI stable across rerenders.
+  return (MOCK_CANDLES as unknown as CandlestickData[]).map((c, i) => {
+    const base = 1.085;
+    const drift = (i - 4) * 0.0012;
+    const open = base + drift + ((c as any).open - 100) * 0.0008;
+    const close = base + drift + ((c as any).close - 100) * 0.0008;
+    const high = Math.max(open, close) + 0.0015;
+    const low = Math.min(open, close) - 0.0015;
+    return {
+      time: (c as any).time,
+      open: Number(open.toFixed(5)),
+      high: Number(high.toFixed(5)),
+      low: Number(low.toFixed(5)),
+      close: Number(close.toFixed(5)),
+    };
+  });
+}
+
+async function fetchKlines(pair: TradingPair, interval: Timeframe): Promise<CandlestickData[]> {
+  if (pair === "EURUSD") return makeEurUsdMockCandles();
+
+  const url = new URL("https://api.binance.com/api/v3/klines");
+  url.searchParams.set("symbol", pair);
+  url.searchParams.set("interval", interval);
+  url.searchParams.set("limit", "500");
+
+  const res = await fetch(url.toString(), { method: "GET" });
+  if (!res.ok) {
+    throw new Error(`Binance API error (${res.status})`);
+  }
+  const raw = (await res.json()) as unknown;
+  if (!Array.isArray(raw)) throw new Error("Unexpected Binance response");
+
+  // Kline format:
+  // [
+  //   0 openTime(ms), 1 open, 2 high, 3 low, 4 close, 5 volume, ...
+  // ]
+  const out: CandlestickData[] = [];
+  for (const k of raw) {
+    if (!Array.isArray(k) || k.length < 5) continue;
+    const openTimeMs = Number(k[0]);
+    const open = Number(k[1]);
+    const high = Number(k[2]);
+    const low = Number(k[3]);
+    const close = Number(k[4]);
+    if (
+      !Number.isFinite(openTimeMs) ||
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close)
+    ) {
+      continue;
+    }
+    out.push({
+      time: toUTCTimestamp(openTimeMs),
+      open,
+      high,
+      low,
+      close,
+    });
+  }
+
+  if (out.length === 0) throw new Error("No candlesticks returned");
+  return out;
+}
+
 export default function ChartContainer({
   title = "Price Chart",
   direction = "BUY",
@@ -57,11 +134,43 @@ export default function ChartContainer({
   lotSize,
   onTradeComplete,
 }: Props) {
+  const [pair, setPair] = useState<TradingPair>("BTCUSDT");
+  const [timeframe, setTimeframe] = useState<Timeframe>("1m");
+  const [candles, setCandles] = useState<CandlestickData[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState<"slow" | "medium" | "fast">("medium");
   const [index, setIndex] = useState(1);
   const [trade, setTrade] = useState<TradeState>({ status: "none" });
   const [strategy, setStrategy] = useState("Default");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setLoading(true);
+        setLoadError(null);
+        const data = await fetchKlines(pair, timeframe);
+        if (cancelled) return;
+        setCandles(data);
+        setIndex(1);
+        setTrade({ status: "none" });
+        setIsPlaying(false);
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(e instanceof Error ? e.message : "Failed to load candles");
+        // Fallback to mock so the UI stays usable.
+        setCandles(MOCK_CANDLES as unknown as CandlestickData[]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pair, timeframe]);
 
   const intervalMs = useMemo(() => {
     if (speed === "slow") return 900;
@@ -69,32 +178,34 @@ export default function ChartContainer({
     return 400;
   }, [speed]);
 
+  const sourceCandles = candles.length > 0 ? candles : (MOCK_CANDLES as unknown as CandlestickData[]);
+
   const visibleCandles = useMemo(
     () =>
-      MOCK_CANDLES.slice(
+      sourceCandles.slice(
         0,
-        Math.max(1, Math.min(index, MOCK_CANDLES.length)),
+        Math.max(1, Math.min(index, sourceCandles.length)),
       ),
-    [index],
+    [index, sourceCandles],
   );
 
   useEffect(() => {
     if (!isPlaying) return;
-    if (index >= MOCK_CANDLES.length) return;
+    if (index >= sourceCandles.length) return;
 
     const id = window.setInterval(() => {
       setIndex((prev) => {
         const next = prev + 1;
-        return next > MOCK_CANDLES.length ? MOCK_CANDLES.length : next;
+        return next > sourceCandles.length ? sourceCandles.length : next;
       });
     }, intervalMs);
 
     return () => window.clearInterval(id);
-  }, [index, intervalMs, isPlaying]);
+  }, [index, intervalMs, isPlaying, sourceCandles.length]);
 
   useEffect(() => {
-    if (index >= MOCK_CANDLES.length && isPlaying) setIsPlaying(false);
-  }, [index, isPlaying]);
+    if (index >= sourceCandles.length && isPlaying) setIsPlaying(false);
+  }, [index, isPlaying, sourceCandles.length]);
 
   // Resolve an open trade as playback reveals candles.
   useEffect(() => {
@@ -106,7 +217,7 @@ export default function ChartContainer({
     // index is count of visible candles; newly revealed candle is at (index - 1)
     if (index - 1 <= trade.entryIndex) return;
 
-    const c = MOCK_CANDLES[index - 1];
+    const c = sourceCandles[index - 1];
     const high = (c as any).high as number;
     const low = (c as any).low as number;
     if (!isFiniteNumber(high) || !isFiniteNumber(low)) return;
@@ -138,7 +249,7 @@ export default function ChartContainer({
       takeProfit: trade.takeProfit,
       lotSize: trade.lotSize,
     });
-  }, [index, isPlaying, trade]);
+  }, [index, isPlaying, sourceCandles, trade]);
 
   // Emit a completed trade record once when resolved.
   const [lastSavedId, setLastSavedId] = useState<string | null>(null);
@@ -191,7 +302,8 @@ export default function ChartContainer({
   const markers: SeriesMarker<Time>[] = useMemo(() => {
     if (trade.status === "none") return [];
 
-    const entryTime = MOCK_CANDLES[trade.entryIndex].time;
+    const entryTime = sourceCandles[trade.entryIndex]?.time;
+    if (!entryTime) return [];
     const entryMarker: SeriesMarker<Time> = {
       time: entryTime,
       position: trade.direction === "BUY" ? "belowBar" : "aboveBar",
@@ -202,7 +314,8 @@ export default function ChartContainer({
 
     if (trade.status === "open") return [entryMarker];
 
-    const exitTime = MOCK_CANDLES[trade.exitIndex].time;
+    const exitTime = sourceCandles[trade.exitIndex]?.time;
+    if (!exitTime) return [entryMarker];
     const exitMarker: SeriesMarker<Time> = {
       time: exitTime,
       position: trade.outcome === "WIN" ? "aboveBar" : "belowBar",
@@ -212,7 +325,7 @@ export default function ChartContainer({
     };
 
     return [entryMarker, exitMarker];
-  }, [trade]);
+  }, [sourceCandles, trade]);
 
   return (
     <section className="rounded-2xl border border-white/10 bg-white/5 p-5">
@@ -220,13 +333,44 @@ export default function ChartContainer({
         <div>
           <div className="text-sm font-semibold text-zinc-100">{title}</div>
           <div className="mt-1 text-xs text-zinc-400">
-            Mock candlestick data (hardcoded)
+            {loading
+              ? `Loading ${pair} ${timeframe} candles…`
+              : loadError
+                ? `Using fallback data • ${loadError}`
+                : pair === "EURUSD"
+                  ? `Mock ${pair} ${timeframe} candles`
+                  : `Live ${pair} ${timeframe} candles (Binance)`}
           </div>
         </div>
         <div className="flex items-center gap-2">
           <div className="hidden text-xs text-zinc-500 sm:block">
-            Candle {visibleCandles.length}/{MOCK_CANDLES.length}
+            Candle {visibleCandles.length}/{sourceCandles.length}
           </div>
+
+          <select
+            value={pair}
+            onChange={(e) => setPair(e.target.value as TradingPair)}
+            className="h-9 rounded-xl border border-white/10 bg-zinc-950/40 px-3 text-xs font-semibold text-zinc-200 outline-none"
+            aria-label="Trading pair"
+            disabled={loading}
+          >
+            <option value="BTCUSDT">BTCUSDT</option>
+            <option value="ETHUSDT">ETHUSDT</option>
+            <option value="EURUSD">EURUSD</option>
+          </select>
+
+          <select
+            value={timeframe}
+            onChange={(e) => setTimeframe(e.target.value as Timeframe)}
+            className="h-9 rounded-xl border border-white/10 bg-zinc-950/40 px-3 text-xs font-semibold text-zinc-200 outline-none"
+            aria-label="Timeframe"
+            disabled={loading}
+          >
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="1h">1h</option>
+          </select>
 
           <select
             value={speed}
@@ -244,6 +388,7 @@ export default function ChartContainer({
               type="button"
               onClick={() => setIsPlaying(true)}
               className="h-9 rounded-xl bg-white px-3 text-xs font-semibold text-black hover:bg-zinc-200"
+              disabled={loading || sourceCandles.length === 0}
             >
               Play
             </button>
@@ -305,6 +450,11 @@ export default function ChartContainer({
       <div
         className={`relative mt-4 w-full overflow-hidden rounded-xl border bg-zinc-950/40 ${outcomeStyles}`}
       >
+        {loading ? (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/30 text-xs font-semibold text-zinc-200 backdrop-blur">
+            Loading candles…
+          </div>
+        ) : null}
         {trade.status === "resolved" ? (
           <div className="absolute right-3 top-3 z-10">
             <div
